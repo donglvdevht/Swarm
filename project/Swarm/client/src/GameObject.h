@@ -31,7 +31,8 @@ struct PropConfig {
     int footprintTiles;
 };
 
-static const std::array<PropConfig, 10> propConfigs = {
+static const std::array<PropConfig, 11> propConfigs = {
+    PropConfig{ 100.0f, 100.0f, 0.0f, 1 }, // None
     PropConfig{ 120.0f, 112.0f, 20.0f, 1 }, // Tree Small
     PropConfig{ 180.0f, 170.0f, 28.0f, 1 }, // Tree Medium
     PropConfig{ 250.0f, 231.0f, 40.0f, 4 }, // Tree Large (2x2)
@@ -71,7 +72,10 @@ private:
     int currentAnimation;
     ObjectType type;
     Direction facingDirection;
-    static constexpr float MOVE_SPEED = 200.0f;
+    bool attacking;
+    float attackTimeRemaining;
+    static constexpr float WALK_SPEED = 100.0f;
+    static constexpr float RUN_SPEED = 260.0f;
 
 public:
     GameObject();
@@ -86,6 +90,7 @@ public:
 
     Direction getFacingDirection() const { return facingDirection; }
     ObjectType getType() const { return type; }
+    bool isAttacking() const { return attacking; }
 
     // Setters
     void setPlayerAnimations(const std::vector<AnimationInfo>& anims) { playerAnimations = anims; }
@@ -96,12 +101,9 @@ public:
     void setPosition(const glm::vec2& pos) { position = pos; }
     void setType(const ObjectType &oType) {type = oType;}
 
-    // Movement methods
-    void moveUp(float deltaTime);
-    void moveDown(float deltaTime);
-    void moveLeft(float deltaTime);
-    void moveRight(float deltaTime);
+    // Action methods
     void attack();
-    void move(const glm::vec2& direction, float deltaTime);
+    void updateAttack(float deltaTime);
+    void move(const glm::vec2& direction, float deltaTime, bool running = false);
 
 };

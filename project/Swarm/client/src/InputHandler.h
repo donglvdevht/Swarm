@@ -6,7 +6,7 @@ class InputHandler {
 public:
     enum class Action {
         MoveLeft, MoveRight, MoveUp, MoveDown,
-        Attack, Jump, Count
+        Attack, Run, Jump, Count
     };
 
     // Handle SDL_Event (SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP)
@@ -34,6 +34,8 @@ private:
         {SDLK_W,        Action::MoveUp},
         {SDLK_UP,       Action::MoveUp},
         {SDLK_J,        Action::Attack},
+        {SDLK_LSHIFT,   Action::Run},
+        {SDLK_RSHIFT,   Action::Run},
         {SDLK_SPACE,    Action::Jump},
     };
 };

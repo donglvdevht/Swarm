@@ -7,6 +7,12 @@
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <sys/socket.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cstdint>
 #include "AnimationData.h"
 #include "Animation.h"
 #include "GameObject.h"
@@ -14,7 +20,12 @@
 #include "SDLState.h"
 #include "AnimationTypes.h"
 #include "InputHandler.h"
+#include "Protocol.h"
 using json = nlohmann::json;
+
+#ifndef SWARM_ASSET_DIR
+#define SWARM_ASSET_DIR "."
+#endif
 
 #define WINDOW_WIDTH 1280
 #define WINDOW_HEIGHT 720
@@ -23,6 +34,7 @@ using json = nlohmann::json;
 
 const float TILE_SIZE = 100.0f;
 const float PLAYER_SIZE = TILE_SIZE * 1.5f;
+constexpr uint64_t TARGET_FRAME_TIME_MS = 16;
 
 struct InputState
 {
@@ -69,6 +81,24 @@ void sortRenderOrder(std::vector<RenderItem>& items)
 }
 
 int main() {
+    // --- Create UDP socket ---
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    // --- Set non-blocking ---
+    int flag = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flag | O_NONBLOCK);
+
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(9000);
+    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
+
+    connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr));
+
     // --- Create the window ---
     SDLState state;
     if (initialize(state))
@@ -87,15 +117,17 @@ int main() {
     player.setPosition(glm::vec2(WINDOW_WIDTH / 2.0f, WINDOW_HEIGHT / 2.0f));
 
     uint64_t prevTime = SDL_GetTicks();
+    uint64_t lastInputSendTime = 0;
     InputState input;
     InputHandler inputHandler;
-    
+
     // --- Start the game loop ---
     bool running = true;
     while (running)
     {
         uint64_t nowTime = SDL_GetTicks();
         float deltaTime = (nowTime - prevTime) / 1000.0f;
+        deltaTime = std::min(deltaTime, 0.1f);
 
 
         SDL_Event event{0};
@@ -115,19 +147,76 @@ int main() {
             }
         }
 
+        const bool moveUp = inputHandler.isHeld(InputHandler::Action::MoveUp);
+        const bool moveDown = inputHandler.isHeld(InputHandler::Action::MoveDown);
+        const bool moveLeft = inputHandler.isHeld(InputHandler::Action::MoveLeft);
+        const bool moveRight = inputHandler.isHeld(InputHandler::Action::MoveRight);
+        const bool runHeld = inputHandler.isHeld(InputHandler::Action::Run);
+        const bool attackPressed = inputHandler.isPressed(InputHandler::Action::Attack);
+
+        // --- Gửi packet định kì để sever biết client còn sống
+        if (attackPressed || nowTime - lastInputSendTime >= 50)
+        {
+            PlayerInputPacket packet{};
+            packet.header.type = PacketType::PLAYER_INPUT;
+            packet.header.tick = htonl(static_cast<uint32_t>(nowTime));
+            packet.up = moveUp;
+            packet.down = moveDown;
+            packet.left = moveLeft;
+            packet.right = moveRight;
+            packet.attack = attackPressed;
+            packet.run = runHeld;
+
+            const ssize_t sent = send(sock, &packet, sizeof(packet), 0);
+            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                perror("send");
+            }
+            else if (sent == static_cast<ssize_t>(sizeof(packet))) {
+                lastInputSendTime = nowTime;
+            }
+        }
+
+        char buffer[1500];
+        while (true)
+        {
+            const ssize_t n = recv(sock, buffer, sizeof(buffer), 0);
+            if (n < 0)
+            {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    break;  // No data
+                }
+                perror("recv");
+                break;
+            }
+
+            if (n == sizeof(EchoReplyPagket))
+            {
+                EchoReplyPagket reply{};
+                memcpy(&reply, buffer, sizeof(reply));
+                if (reply.header.type == PacketType::ECHO_REPLY)
+                {
+                    const uint32_t tick = ntohl(reply.header.tick);
+                    printf("EchoReply tick = %u\n", tick);
+                }
+            }
+        }
+
         glm::vec2 moveDir{0.0f, 0.0f};
-        if (inputHandler.isHeld(InputHandler::Action::MoveUp))    moveDir.y -= 1.0f;
-        if (inputHandler.isHeld(InputHandler::Action::MoveDown))  moveDir.y += 1.0f;
-        if (inputHandler.isHeld(InputHandler::Action::MoveLeft))  moveDir.x -= 1.0f;
-        if (inputHandler.isHeld(InputHandler::Action::MoveRight)) moveDir.x += 1.0f;
+        if (moveUp)    moveDir.y -= 1.0f;
+        if (moveDown)  moveDir.y += 1.0f;
+        if (moveLeft)  moveDir.x -= 1.0f;
+        if (moveRight) moveDir.x += 1.0f;
 
         if (glm::length(moveDir) > 0.0f) {
-            player.move(glm::normalize(moveDir), deltaTime);
+            player.move(glm::normalize(moveDir), deltaTime, runHeld);
         }
 
-        if (inputHandler.isPressed(InputHandler::Action::Attack)) {
+        if (attackPressed) {
             player.attack();
         }
+
+        player.updateAttack(deltaTime);
 
         PlayerAnim nextAnimation;
         nextAnimation = resolvePlayerAnim(inputHandler, player, player.getCurrentAnimation());
@@ -148,7 +237,11 @@ int main() {
         std::vector<RenderItem> renderOrder;
         for (GameObject& object : gameState.layer[1]) {
             const int animIndex = object.getCurrentAnimation();
-            const float objDepth = object.getPosition().y + propConfigs[animIndex].footHeight;
+            const float footHeight = animIndex >= 0 &&
+                animIndex < static_cast<int>(propConfigs.size())
+                ? propConfigs[animIndex].footHeight
+                : TILE_SIZE;
+            const float objDepth = object.getPosition().y + footHeight;
             renderOrder.push_back({ objDepth, false, &object });
         }
         renderOrder.push_back({ player.getPosition().y + PLAYER_SIZE * 0.5f, true, &player });
@@ -164,6 +257,11 @@ int main() {
 
         SDL_RenderPresent(state.renderer);
         inputHandler.update();
+
+        const uint64_t frameTime = SDL_GetTicks() - nowTime;
+        if (frameTime < TARGET_FRAME_TIME_MS) {
+            SDL_Delay(static_cast<uint32_t>(TARGET_FRAME_TIME_MS - frameTime));
+        }
         prevTime = nowTime;
     }
 
@@ -208,7 +306,7 @@ bool initialize(SDLState &state)
 
 PlayerAnim resolvePlayerAnim(InputHandler& input, const GameObject& player, int currentAnimation)
 {
-    const bool attacking = input.isHeld(InputHandler::Action::Attack);
+    const bool attacking = player.isAttacking();
 
     if (attacking) {
         switch (player.getFacingDirection()) {
@@ -218,6 +316,14 @@ PlayerAnim resolvePlayerAnim(InputHandler& input, const GameObject& player, int 
             case Direction::Down:
             default:              return PlayerAnim::AttackDown;
         }
+    }
+
+    const bool running = input.isHeld(InputHandler::Action::Run);
+    if (running) {
+        if (input.isHeld(InputHandler::Action::MoveUp))    return PlayerAnim::RunUp;
+        if (input.isHeld(InputHandler::Action::MoveDown))  return PlayerAnim::RunDown;
+        if (input.isHeld(InputHandler::Action::MoveLeft))  return PlayerAnim::RunLeft;
+        if (input.isHeld(InputHandler::Action::MoveRight)) return PlayerAnim::RunRight;
     }
 
     if (input.isHeld(InputHandler::Action::MoveUp))    return PlayerAnim::WalkUp;
@@ -243,6 +349,9 @@ void drawObject (const SDLState &state, GameObject &obj, float deltaTime)
         return;
     }
         AnimationInfo& info = animations[currentAnimation];
+        if (!info.texture || info.columns <= 0 || info.rows <= 0) {
+            return;
+        }
         // --- update animation theo deltaTime ---
         info.anim.update(deltaTime);
 
@@ -346,7 +455,11 @@ void drawMap(const SDLState &state, GameState &gs)
             info.frameWidth,
             info.frameHeight
         };
-        SDL_FRect destRect{position.x, position.y, propConfigs[animIndex].targetHeight, propConfigs[animIndex].targetHeight};
+        float targetSize = TILE_SIZE;
+        if (animIndex < static_cast<int>(propConfigs.size())) {
+            targetSize = propConfigs[animIndex].targetHeight;
+        }
+        SDL_FRect destRect{position.x, position.y, targetSize, targetSize};
 
         SDL_RenderTexture(state.renderer, info.texture, nullptr, &destRect);
     }
@@ -354,9 +467,10 @@ void drawMap(const SDLState &state, GameState &gs)
 
 void createTiles(const SDLState &state, GameState &gs, const Resources &res)
 {
-    std::ifstream file("src/map.json");
+    const std::string mapPath = std::string(SWARM_ASSET_DIR) + "/map.json";
+    std::ifstream file(mapPath);
     if (!file.is_open()) {
-        std::fprintf(stderr, "Failed to open map file: src/map.json\n");
+        std::fprintf(stderr, "Failed to open map file: %s\n", mapPath.c_str());
         return;
     }
 

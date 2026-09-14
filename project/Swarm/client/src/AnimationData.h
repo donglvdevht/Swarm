@@ -12,6 +12,10 @@ namespace DefPlayerAnim
     constexpr int   FRONT_WALKING_FRAMES   = 20;
     constexpr float FRONT_WALKING_FRAME_TIME = 0.08f;
 
+    // Run
+    constexpr int   FRONT_RUNNING_FRAMES   = 12;
+    constexpr float FRONT_RUNNING_FRAME_TIME = 0.06f;
+
     // Attack
     constexpr int   ATTACK_FRAMES     = 10;
     constexpr float ATTACK_FRAME_TIME = 0.05f;

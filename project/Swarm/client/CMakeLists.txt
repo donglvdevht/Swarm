@@ -16,8 +16,17 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glm)
 
-add_executable(client "src/main.cpp" "src/Resources.cpp" "src/InputHandler.cpp" "src/GameObject.cpp" "src/Animation.h" "src/AnimationData.h" "src/GameObject.h" 
-                "src/Resources.h" "src/SDLState.h" "src/AnimationTypes.h" "src/InputHandler.h")
+add_executable(client "src/main.cpp" "src/Resources.cpp" "src/InputHandler.cpp" "src/GameObject.cpp" "src/Animation.h" "src/AnimationData.h" "src/GameObject.h"
+                "src/Resources.h" "src/SDLState.h" "src/AnimationTypes.h" "src/InputHandler.h"
+                "../common/include/Protocol.h")
+
+target_include_directories(client PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../common/include"
+)
+
+target_compile_definitions(client PRIVATE
+    SWARM_ASSET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
 
 target_link_libraries(client PRIVATE
     SDL3::SDL3
