@@ -5,6 +5,6 @@ struct SDLState
 {
     SDL_Window *window;
     SDL_Renderer *renderer;
-    int logW = 1440;
-    int logH = 720;
+    int logicalWidth   = 1920;
+    int logicalHeight  = 1080;
 };

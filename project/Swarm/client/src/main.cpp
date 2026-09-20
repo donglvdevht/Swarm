@@ -7,12 +7,8 @@
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <fstream>
-#include <sys/socket.h>
-#include <fcntl.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <cerrno>
 #include <cstdint>
+#include <deque>
 #include "AnimationData.h"
 #include "Animation.h"
 #include "GameObject.h"
@@ -20,7 +16,7 @@
 #include "SDLState.h"
 #include "AnimationTypes.h"
 #include "InputHandler.h"
-#include "Protocol.h"
+#include "Network.h"
 using json = nlohmann::json;
 
 #ifndef SWARM_ASSET_DIR
@@ -34,16 +30,13 @@ using json = nlohmann::json;
 
 const float TILE_SIZE = 100.0f;
 const float PLAYER_SIZE = TILE_SIZE * 1.5f;
-constexpr uint64_t TARGET_FRAME_TIME_MS = 16;
+constexpr uint64_t TARGET_FRAME_TIME_MS = 8;
+constexpr float FIXED_DT   = 0.05f;
 
-struct InputState
+struct PendingInput
 {
-    bool left  = false;
-    bool right = false;
-    bool up    = false;
-    bool down  = false;
-    bool attack = false;
-    bool jump  = false;
+    uint32_t seq;
+    bool up, down, left, right, run;
 };
 
 struct GameState
@@ -81,27 +74,14 @@ void sortRenderOrder(std::vector<RenderItem>& items)
 }
 
 int main() {
-    // --- Create UDP socket ---
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("socket");
-        return 1;
-    }
-
-    // --- Set non-blocking ---
-    int flag = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flag | O_NONBLOCK);
-
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(9000);
-    inet_pton(AF_INET, "127.0.0.1", &serverAddr.sin_addr);
-
-    connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr));
-
     // --- Create the window ---
     SDLState state;
     if (initialize(state))
+        return -1;
+
+    // --- Create the metwork ---
+    Network network;
+    if (!network.start("127.0.0.1", 9000))
         return -1;
 
     Resources res;
@@ -114,12 +94,19 @@ int main() {
     GameObject player;
     player.setPlayerAnimations(res.playerAnimations);
     player.setCurrentAnimation((int)PlayerAnim::IdleDown);
-    player.setPosition(glm::vec2(WINDOW_WIDTH / 2.0f, WINDOW_HEIGHT / 2.0f));
+    player.setPosition(glm::vec2(state.logicalWidth / 2.0f, state.logicalHeight / 2.0f));
 
     uint64_t prevTime = SDL_GetTicks();
     uint64_t lastInputSendTime = 0;
-    InputState input;
     InputHandler inputHandler;
+    std::deque<PendingInput> pendingInputs;
+    uint32_t lastPushedSeq = network.getCurrentSeq();
+    bool hasPushedSeq = false;
+
+    // --- Đếm FPS ---
+    uint64_t fpsTimerMs = SDL_GetTicks();
+    int frameCounter = 0;
+    int currentFps = 0;
 
     // --- Start the game loop ---
     bool running = true;
@@ -128,6 +115,14 @@ int main() {
         uint64_t nowTime = SDL_GetTicks();
         float deltaTime = (nowTime - prevTime) / 1000.0f;
         deltaTime = std::min(deltaTime, 0.1f);
+
+        frameCounter++;
+        if (nowTime - fpsTimerMs >= 1000)
+        {
+            currentFps = frameCounter;
+            frameCounter = 0;
+            fpsTimerMs = nowTime;
+        }
 
 
         SDL_Event event{0};
@@ -154,53 +149,7 @@ int main() {
         const bool runHeld = inputHandler.isHeld(InputHandler::Action::Run);
         const bool attackPressed = inputHandler.isPressed(InputHandler::Action::Attack);
 
-        // --- Gửi packet định kì để sever biết client còn sống
-        if (attackPressed || nowTime - lastInputSendTime >= 50)
-        {
-            PlayerInputPacket packet{};
-            packet.header.type = PacketType::PLAYER_INPUT;
-            packet.header.tick = htonl(static_cast<uint32_t>(nowTime));
-            packet.up = moveUp;
-            packet.down = moveDown;
-            packet.left = moveLeft;
-            packet.right = moveRight;
-            packet.attack = attackPressed;
-            packet.run = runHeld;
-
-            const ssize_t sent = send(sock, &packet, sizeof(packet), 0);
-            if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                perror("send");
-            }
-            else if (sent == static_cast<ssize_t>(sizeof(packet))) {
-                lastInputSendTime = nowTime;
-            }
-        }
-
-        char buffer[1500];
-        while (true)
-        {
-            const ssize_t n = recv(sock, buffer, sizeof(buffer), 0);
-            if (n < 0)
-            {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    break;  // No data
-                }
-                perror("recv");
-                break;
-            }
-
-            if (n == sizeof(EchoReplyPagket))
-            {
-                EchoReplyPagket reply{};
-                memcpy(&reply, buffer, sizeof(reply));
-                if (reply.header.type == PacketType::ECHO_REPLY)
-                {
-                    const uint32_t tick = ntohl(reply.header.tick);
-                    printf("EchoReply tick = %u\n", tick);
-                }
-            }
-        }
+        network.updateInput(moveUp, moveDown, moveLeft, moveRight, attackPressed, runHeld);
 
         glm::vec2 moveDir{0.0f, 0.0f};
         if (moveUp)    moveDir.y -= 1.0f;
@@ -210,6 +159,44 @@ int main() {
 
         if (glm::length(moveDir) > 0.0f) {
             player.move(glm::normalize(moveDir), deltaTime, runHeld);
+        }
+
+        const uint32_t currentSeq = network.getCurrentSeq();
+        if (!hasPushedSeq || currentSeq != lastPushedSeq)
+        {
+            pendingInputs.push_back({currentSeq, moveUp, moveDown, moveLeft, moveRight, attackPressed});
+            lastPushedSeq = currentSeq;
+            hasPushedSeq = true;
+        }
+
+        ServerState severState = network.getSeverState();
+        // --- Nếu có cập nhật từ sever ---
+        if (severState.valid)
+        {
+            // Xóa input đã được server xử lý
+            while (!pendingInputs.empty() && pendingInputs.front().seq <= severState.lastProcessedSeq)
+            {
+                pendingInputs.pop_front();
+            }
+
+            // Snap về vị trí server
+            player.setPosition(glm::vec2(severState.x, severState.y));
+
+            for (const auto& inp : pendingInputs)
+            {
+                glm::vec2 dir{0.0f, 0.0f};
+
+                if (inp.up)    dir.y -= 1.0f;
+                if (inp.down)  dir.y += 1.0f;
+                if (inp.left)  dir.x -= 1.0f;
+                if (inp.right) dir.x += 1.0f;
+
+                if (glm::length(dir) > 0.0001f)
+                {
+                    // Dùng cùng FIXED_DT với server (0.05f)
+                    player.move(glm::normalize(dir), FIXED_DT, inp.run);
+                }
+            }
         }
 
         if (attackPressed) {
@@ -254,6 +241,12 @@ int main() {
                 drawDecorationObject(state, *item.obj);
             }
         }
+
+        // --- Hiển thị FPS ở góc trên-trái ---
+        SDL_SetRenderDrawColor(state.renderer, 255, 255, 0, 255);
+        SDL_SetRenderScale(state.renderer, 2.0f, 2.0f);
+        SDL_RenderDebugTextFormat(state.renderer, 5.0f, 5.0f, "FPS: %d", currentFps);
+        SDL_SetRenderScale(state.renderer, 1.0f, 1.0f);
 
         SDL_RenderPresent(state.renderer);
         inputHandler.update();
@@ -300,7 +293,7 @@ bool initialize(SDLState &state)
 
     int width = 1920;
     int height = 1080;
-    SDL_SetRenderLogicalPresentation(state.renderer, width, height, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+    SDL_SetRenderLogicalPresentation(state.renderer, state.logicalWidth, state.logicalHeight, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     return 0;
 }
 
@@ -390,7 +383,7 @@ void drawDecorationObject(const SDLState &state, GameObject &obj)
         return;
     }
 
-    AnimationInfo& info = animations[animIndex];
+    const AnimationInfo& info = animations[animIndex];
     if (!info.texture) {
         return;
     }
@@ -408,7 +401,9 @@ void drawDecorationObject(const SDLState &state, GameObject &obj)
         targetSize = propConfigs[animIndex].targetHeight;
     }
 
-    SDL_FRect destRect{position.x, position.y, targetSize, targetSize};
+    // --- Vẽ Decoration ---
+    const float aspect = (info.frameHeight > 0.0f) ? (info.frameWidth / info.frameHeight) : 1.0f;
+    SDL_FRect destRect{position.x, position.y, targetSize * aspect, targetSize};
     SDL_RenderTexture(state.renderer, info.texture, &srcRect, &destRect);
 }
 
@@ -421,7 +416,7 @@ void drawMap(const SDLState &state, GameState &gs)
             continue;
         }
 
-        AnimationInfo& info = animations[animIndex];
+        const AnimationInfo& info = animations[animIndex];
         if (!info.texture) {
             continue;
         }
@@ -444,7 +439,7 @@ void drawMap(const SDLState &state, GameState &gs)
             continue;
         }
 
-        AnimationInfo& info = animations[animIndex];
+        const AnimationInfo& info = animations[animIndex];
         if (!info.texture) {
             continue;
         }
@@ -459,7 +454,9 @@ void drawMap(const SDLState &state, GameState &gs)
         if (animIndex < static_cast<int>(propConfigs.size())) {
             targetSize = propConfigs[animIndex].targetHeight;
         }
-        SDL_FRect destRect{position.x, position.y, targetSize, targetSize};
+        // --- Giữ đúng tỉ lệ khung hình gốc, không ép vuông ---
+        const float aspect = (info.frameHeight > 0.0f) ? (info.frameWidth / info.frameHeight) : 1.0f;
+        SDL_FRect destRect{position.x, position.y, targetSize * aspect, targetSize};
 
         SDL_RenderTexture(state.renderer, info.texture, nullptr, &destRect);
     }
@@ -485,7 +482,7 @@ void createTiles(const SDLState &state, GameState &gs, const Resources &res)
         o.setType(type);
         o.setPosition(glm::vec2(c * TILE_SIZE, r * TILE_SIZE));
         o.setCurrentAnimation(value);
-        o.setGroundAnimations(res.groundAnimations);
+        o.setGroundAnimations(&res.groundAnimations);
         return o;
     };
 
@@ -495,7 +492,7 @@ void createTiles(const SDLState &state, GameState &gs, const Resources &res)
         o.setType(type);
         o.setPosition(glm::vec2(c * TILE_SIZE, r * TILE_SIZE));
         o.setCurrentAnimation(value);
-        o.setDecorationAnimations(res.decorationAnimations);
+        o.setDecorationAnimations(&res.decorationAnimations);
         return o;
     };
 
