@@ -5,10 +5,10 @@
 #include <vector>
 #include <string>
 #include <algorithm>
-#include <nlohmann/json.hpp>
-#include <fstream>
 #include <cstdint>
 #include <deque>
+#include <memory>
+
 #include "AnimationData.h"
 #include "Animation.h"
 #include "GameObject.h"
@@ -17,7 +17,8 @@
 #include "AnimationTypes.h"
 #include "InputHandler.h"
 #include "Network.h"
-using json = nlohmann::json;
+#include "GameScene.h"
+#include "LoginScene.h"
 
 #ifndef SWARM_ASSET_DIR
 #define SWARM_ASSET_DIR "."
@@ -25,53 +26,11 @@ using json = nlohmann::json;
 
 #define WINDOW_WIDTH 1280
 #define WINDOW_HEIGHT 720
-#define MAP_ROWS 11
-#define MAP_COL 20
 
-const float TILE_SIZE = 100.0f;
-const float PLAYER_SIZE = TILE_SIZE * 1.5f;
 constexpr uint64_t TARGET_FRAME_TIME_MS = 8;
-constexpr float FIXED_DT   = 0.05f;
-
-struct PendingInput
-{
-    uint32_t seq;
-    bool up, down, left, right, run;
-};
-
-struct GameState
-{
-    // ground, static objects, characters
-    std::array<std::vector<GameObject>, 3> layer;
-    int playerIndex;
-
-    GameState()
-    {
-        playerIndex = 0;
-    }
-};
 
 void cleanup(SDLState &state);
 bool initialize(SDLState &state);
-void drawObject (const SDLState &state, GameObject &obj, float deltaTime);
-void drawDecorationObject(const SDLState &state, GameObject &obj);
-void drawMap(const SDLState &state, GameState &gs);
-PlayerAnim resolvePlayerAnim(InputHandler& input, const GameObject& player, int currentAnimation);
-void createTiles(const SDLState &state, GameState &gs, const Resources &res);
-
-struct RenderItem
-{
-    float depth;
-    bool isPlayer;
-    GameObject* obj;
-};
-
-void sortRenderOrder(std::vector<RenderItem>& items)
-{
-    std::sort(items.begin(), items.end(), [](const RenderItem& a, const RenderItem& b) {
-        return a.depth < b.depth;
-    });
-}
 
 int main() {
     // --- Create the window ---
@@ -81,27 +40,13 @@ int main() {
 
     // --- Create the metwork ---
     Network network;
-    if (!network.start("127.0.0.1", 9000))
-        return -1;
+    network.start("127.0.0.1", 9000);
 
     Resources res;
     res.load(state);
 
-    GameState gameState;
-    createTiles(state, gameState, res);
-
-    // --- Setup gamedata
-    GameObject player;
-    player.setPlayerAnimations(res.playerAnimations);
-    player.setCurrentAnimation((int)PlayerAnim::IdleDown);
-    player.setPosition(glm::vec2(state.logicalWidth / 2.0f, state.logicalHeight / 2.0f));
-
+    std::unique_ptr<Scene> scene = std::make_unique<LoginScene>(network);
     uint64_t prevTime = SDL_GetTicks();
-    uint64_t lastInputSendTime = 0;
-    InputHandler inputHandler;
-    std::deque<PendingInput> pendingInputs;
-    uint32_t lastPushedSeq = network.getCurrentSeq();
-    bool hasPushedSeq = false;
 
     // --- Đếm FPS ---
     uint64_t fpsTimerMs = SDL_GetTicks();
@@ -124,123 +69,23 @@ int main() {
             fpsTimerMs = nowTime;
         }
 
-
         SDL_Event event{0};
         while (SDL_PollEvent(&event))
         {
-            switch (event.type)
+            if (event.type == SDL_EVENT_QUIT) 
             {
-                case SDL_EVENT_QUIT:
-                    running = false;
-                    break;
-                case SDL_EVENT_KEY_DOWN:
-                case SDL_EVENT_KEY_UP:
-                {
-                    inputHandler.handleEvent(event);
-                    break;
-                }
+                running = false; 
+                break;
             }
+            scene->handleEvent(event);
         }
-
-        const bool moveUp = inputHandler.isHeld(InputHandler::Action::MoveUp);
-        const bool moveDown = inputHandler.isHeld(InputHandler::Action::MoveDown);
-        const bool moveLeft = inputHandler.isHeld(InputHandler::Action::MoveLeft);
-        const bool moveRight = inputHandler.isHeld(InputHandler::Action::MoveRight);
-        const bool runHeld = inputHandler.isHeld(InputHandler::Action::Run);
-        const bool attackPressed = inputHandler.isPressed(InputHandler::Action::Attack);
-
-        network.updateInput(moveUp, moveDown, moveLeft, moveRight, attackPressed, runHeld);
-
-        glm::vec2 moveDir{0.0f, 0.0f};
-        if (moveUp)    moveDir.y -= 1.0f;
-        if (moveDown)  moveDir.y += 1.0f;
-        if (moveLeft)  moveDir.x -= 1.0f;
-        if (moveRight) moveDir.x += 1.0f;
-
-        if (glm::length(moveDir) > 0.0f) {
-            player.move(glm::normalize(moveDir), deltaTime, runHeld);
-        }
-
-        const uint32_t currentSeq = network.getCurrentSeq();
-        if (!hasPushedSeq || currentSeq != lastPushedSeq)
-        {
-            pendingInputs.push_back({currentSeq, moveUp, moveDown, moveLeft, moveRight, attackPressed});
-            lastPushedSeq = currentSeq;
-            hasPushedSeq = true;
-        }
-
-        ServerState severState = network.getSeverState();
-        // --- Nếu có cập nhật từ sever ---
-        if (severState.valid)
-        {
-            // Xóa input đã được server xử lý
-            while (!pendingInputs.empty() && pendingInputs.front().seq <= severState.lastProcessedSeq)
-            {
-                pendingInputs.pop_front();
-            }
-
-            // Snap về vị trí server
-            player.setPosition(glm::vec2(severState.x, severState.y));
-
-            for (const auto& inp : pendingInputs)
-            {
-                glm::vec2 dir{0.0f, 0.0f};
-
-                if (inp.up)    dir.y -= 1.0f;
-                if (inp.down)  dir.y += 1.0f;
-                if (inp.left)  dir.x -= 1.0f;
-                if (inp.right) dir.x += 1.0f;
-
-                if (glm::length(dir) > 0.0001f)
-                {
-                    // Dùng cùng FIXED_DT với server (0.05f)
-                    player.move(glm::normalize(dir), FIXED_DT, inp.run);
-                }
-            }
-        }
-
-        if (attackPressed) {
-            player.attack();
-        }
-
-        player.updateAttack(deltaTime);
-
-        PlayerAnim nextAnimation;
-        nextAnimation = resolvePlayerAnim(inputHandler, player, player.getCurrentAnimation());
-
-        // --- Switch animation only when changing ---
-        if ((int)nextAnimation != player.getCurrentAnimation())
-        {
-            player.setCurrentAnimation((int)nextAnimation);
-            player.getPlayerAnimations()[player.getCurrentAnimation()].anim.reset();
-        }
+        scene->update(deltaTime);
 
         // --- Vẽ ---
         SDL_SetRenderDrawColor(state.renderer, 20, 10, 30, 255);
         SDL_RenderClear(state.renderer);
 
-        drawMap(state, gameState);
-
-        std::vector<RenderItem> renderOrder;
-        for (GameObject& object : gameState.layer[1]) {
-            const int animIndex = object.getCurrentAnimation();
-            const float footHeight = animIndex >= 0 &&
-                animIndex < static_cast<int>(propConfigs.size())
-                ? propConfigs[animIndex].footHeight
-                : TILE_SIZE;
-            const float objDepth = object.getPosition().y + footHeight;
-            renderOrder.push_back({ objDepth, false, &object });
-        }
-        renderOrder.push_back({ player.getPosition().y + PLAYER_SIZE * 0.5f, true, &player });
-        sortRenderOrder(renderOrder);
-
-        for (const RenderItem& item : renderOrder) {
-            if (item.isPlayer) {
-                drawObject(state, *item.obj, deltaTime);
-            } else {
-                drawDecorationObject(state, *item.obj);
-            }
-        }
+        scene->render(state, deltaTime);
 
         // --- Hiển thị FPS ở góc trên-trái ---
         SDL_SetRenderDrawColor(state.renderer, 255, 255, 0, 255);
@@ -249,7 +94,14 @@ int main() {
         SDL_SetRenderScale(state.renderer, 1.0f, 1.0f);
 
         SDL_RenderPresent(state.renderer);
-        inputHandler.update();
+
+        scene->endFrame();
+
+        switch (scene->requestedScene()) {      // chuyển scene
+            case SceneId::Quit: running = false; break;
+            case SceneId::Game: scene = std::make_unique<GameScene>(state, res, network); break;
+            default: break;
+        }
 
         const uint64_t frameTime = SDL_GetTicks() - nowTime;
         if (frameTime < TARGET_FRAME_TIME_MS) {
@@ -258,6 +110,7 @@ int main() {
         prevTime = nowTime;
     }
 
+    scene.reset();
     res.unload();
     cleanup(state);
     return 0;
@@ -276,7 +129,7 @@ bool initialize(SDLState &state)
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Error initializing SDL3", nullptr);
         return 1;
     }
-    state.window = SDL_CreateWindow("Swarm", WINDOW_WIDTH, WINDOW_HEIGHT, 0);
+    state.window = SDL_CreateWindow("Swarm", state.logicalWidth, state.logicalHeight, 0);
     if (!state.window) {
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Error creating window", nullptr);
         cleanup(state);
@@ -291,222 +144,6 @@ bool initialize(SDLState &state)
         return 1;
     }
 
-    int width = 1920;
-    int height = 1080;
     SDL_SetRenderLogicalPresentation(state.renderer, state.logicalWidth, state.logicalHeight, SDL_LOGICAL_PRESENTATION_LETTERBOX);
     return 0;
-}
-
-PlayerAnim resolvePlayerAnim(InputHandler& input, const GameObject& player, int currentAnimation)
-{
-    const bool attacking = player.isAttacking();
-
-    if (attacking) {
-        switch (player.getFacingDirection()) {
-            case Direction::Up:    return PlayerAnim::AttackUp;
-            case Direction::Left:  return PlayerAnim::AttackLeft;
-            case Direction::Right: return PlayerAnim::AttackRight;
-            case Direction::Down:
-            default:              return PlayerAnim::AttackDown;
-        }
-    }
-
-    const bool running = input.isHeld(InputHandler::Action::Run);
-    if (running) {
-        if (input.isHeld(InputHandler::Action::MoveUp))    return PlayerAnim::RunUp;
-        if (input.isHeld(InputHandler::Action::MoveDown))  return PlayerAnim::RunDown;
-        if (input.isHeld(InputHandler::Action::MoveLeft))  return PlayerAnim::RunLeft;
-        if (input.isHeld(InputHandler::Action::MoveRight)) return PlayerAnim::RunRight;
-    }
-
-    if (input.isHeld(InputHandler::Action::MoveUp))    return PlayerAnim::WalkUp;
-    if (input.isHeld(InputHandler::Action::MoveDown))  return PlayerAnim::WalkDown;
-    if (input.isHeld(InputHandler::Action::MoveLeft))  return PlayerAnim::WalkLeft;
-    if (input.isHeld(InputHandler::Action::MoveRight)) return PlayerAnim::WalkRight;
-
-    switch (player.getFacingDirection()) {
-        case Direction::Up:    return PlayerAnim::IdleUp;
-        case Direction::Left:  return PlayerAnim::IdleLeft;
-        case Direction::Right: return PlayerAnim::IdleRight;
-        case Direction::Down:
-        default:              return PlayerAnim::IdleDown;
-    }
-}
-
-
-void drawObject (const SDLState &state, GameObject &obj, float deltaTime)
-{
-        auto& animations = obj.getPlayerAnimations();
-        int currentAnimation = obj.getCurrentAnimation();
-    if (currentAnimation < 0 || currentAnimation >= static_cast<int>(animations.size())) {
-        return;
-    }
-        AnimationInfo& info = animations[currentAnimation];
-        if (!info.texture || info.columns <= 0 || info.rows <= 0) {
-            return;
-        }
-        // --- update animation theo deltaTime ---
-        info.anim.update(deltaTime);
-
-        int frameIndex = currentAnimation != -1
-            ? info.anim.getCurrentFrame()
-            : 0;
-
-        int currentCol = frameIndex % info.columns;
-        int currentRow = frameIndex / info.columns;
-
-        // --- srcRect: cắt frame từ ảnh gốc ---
-        SDL_FRect srcRect = {
-            currentCol * info.frameWidth,   // x = cột * chiều rộng 1 frame
-            currentRow * info.frameHeight,   // y = hàng * chiều cao 1 frame
-            info.frameWidth,
-            info.frameHeight
-        };
-
-        // --- destRect: vị trí + kích thước hiển thị trên màn hình ---
-        glm::vec2 pos = obj.getPosition();
-        SDL_FRect destRect = {
-            pos.x - PLAYER_SIZE / 2.0f,    // vị trí x (centered)
-            pos.y - PLAYER_SIZE / 2.0f,    // vị trí y (centered)
-            PLAYER_SIZE,
-            PLAYER_SIZE
-        };
-
-        SDL_RenderTexture(state.renderer, info.texture, &srcRect, &destRect);
-}
-
-void drawDecorationObject(const SDLState &state, GameObject &obj)
-{
-    auto& animations = obj.getDecorationAnimations();
-    const int animIndex = obj.getCurrentAnimation();
-    if (animIndex < 0 || animIndex >= static_cast<int>(animations.size())) {
-        return;
-    }
-
-    const AnimationInfo& info = animations[animIndex];
-    if (!info.texture) {
-        return;
-    }
-
-    const glm::vec2 position = obj.getPosition();
-    SDL_FRect srcRect = {
-        0,
-        0,
-        info.frameWidth,
-        info.frameHeight
-    };
-
-    float targetSize = TILE_SIZE;
-    if (animIndex >= 0 && animIndex < static_cast<int>(propConfigs.size())) {
-        targetSize = propConfigs[animIndex].targetHeight;
-    }
-
-    // --- Vẽ Decoration ---
-    const float aspect = (info.frameHeight > 0.0f) ? (info.frameWidth / info.frameHeight) : 1.0f;
-    SDL_FRect destRect{position.x, position.y, targetSize * aspect, targetSize};
-    SDL_RenderTexture(state.renderer, info.texture, &srcRect, &destRect);
-}
-
-void drawMap(const SDLState &state, GameState &gs)
-{
-    for (GameObject& tile : gs.layer[0]) {
-        auto& animations = tile.getGroundAnimations();
-        const int animIndex = tile.getCurrentAnimation();
-        if (animIndex < 0 || animIndex >= static_cast<int>(animations.size())) {
-            continue;
-        }
-
-        const AnimationInfo& info = animations[animIndex];
-        if (!info.texture) {
-            continue;
-        }
-
-        const glm::vec2 position = tile.getPosition();
-        SDL_FRect srcRect = {
-            0,
-            0,
-            info.frameWidth,
-            info.frameHeight
-        };
-        SDL_FRect destRect{position.x, position.y, TILE_SIZE, TILE_SIZE};
-        SDL_RenderTexture(state.renderer, info.texture, nullptr, &destRect);
-    }
-
-    for (GameObject& object : gs.layer[1]) {
-        auto& animations = object.getDecorationAnimations();
-        const int animIndex = object.getCurrentAnimation();
-        if (animIndex < 0 || animIndex >= static_cast<int>(animations.size())) {
-            continue;
-        }
-
-        const AnimationInfo& info = animations[animIndex];
-        if (!info.texture) {
-            continue;
-        }
-        const glm::vec2 position = object.getPosition();
-        SDL_FRect srcRect = {
-            0,
-            0,
-            info.frameWidth,
-            info.frameHeight
-        };
-        float targetSize = TILE_SIZE;
-        if (animIndex < static_cast<int>(propConfigs.size())) {
-            targetSize = propConfigs[animIndex].targetHeight;
-        }
-        // --- Giữ đúng tỉ lệ khung hình gốc, không ép vuông ---
-        const float aspect = (info.frameHeight > 0.0f) ? (info.frameWidth / info.frameHeight) : 1.0f;
-        SDL_FRect destRect{position.x, position.y, targetSize * aspect, targetSize};
-
-        SDL_RenderTexture(state.renderer, info.texture, nullptr, &destRect);
-    }
-}
-
-void createTiles(const SDLState &state, GameState &gs, const Resources &res)
-{
-    const std::string mapPath = std::string(SWARM_ASSET_DIR) + "/map.json";
-    std::ifstream file(mapPath);
-    if (!file.is_open()) {
-        std::fprintf(stderr, "Failed to open map file: %s\n", mapPath.c_str());
-        return;
-    }
-
-    json data;
-    file >> data;
-    int rows = data["rows"];
-    int cols = data["cols"];
-
-    const auto createGroundTile = [&res](int r, int c, ObjectType type, short value)
-    {
-        GameObject o;
-        o.setType(type);
-        o.setPosition(glm::vec2(c * TILE_SIZE, r * TILE_SIZE));
-        o.setCurrentAnimation(value);
-        o.setGroundAnimations(&res.groundAnimations);
-        return o;
-    };
-
-    const auto createDecorationTile = [&res](int r, int c, ObjectType type, short value)
-    {
-        GameObject o;
-        o.setType(type);
-        o.setPosition(glm::vec2(c * TILE_SIZE, r * TILE_SIZE));
-        o.setCurrentAnimation(value);
-        o.setDecorationAnimations(&res.decorationAnimations);
-        return o;
-    };
-
-    for (int r = 0; r < MAP_ROWS; r++)
-    {
-        for (int c = 0; c < MAP_COL; c++)
-        {
-            if (data["groundMap"][r][c] != 0) {
-                gs.layer[0].push_back(createGroundTile(r, c, ObjectType::level, data["groundMap"][r][c]));
-            }
-
-            if (data["objectMap"][r][c] != 0) {
-                gs.layer[1].push_back(createDecorationTile(r, c, ObjectType::level, data["objectMap"][r][c]));
-            }
-        }
-    }
 }

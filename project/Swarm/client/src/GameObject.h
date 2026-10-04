@@ -98,10 +98,10 @@ private:
     Direction facingDirection;
     bool attacking;
     float attackTimeRemaining;
-    static constexpr float WALK_SPEED = 100.0f;
-    static constexpr float RUN_SPEED = 260.0f;
 
 public:
+    static constexpr float WALK_SPEED = 100.0f;
+    static constexpr float RUN_SPEED = 260.0f;
     GameObject();
 
     // Getters

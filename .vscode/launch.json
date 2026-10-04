@@ -1,0 +1,44 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Client (Debug)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/project/Swarm/client/build/client",
+            "args": [],
+            "cwd": "${workspaceFolder}/project/Swarm/client",
+            "stopAtEntry": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "externalConsole": false
+        },
+        {
+            "name": "Server (Debug)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/project/Swarm/server/build/server",
+            "args": [
+                "${workspaceFolder}/project/Swarm/server/users.json"
+            ],
+            "cwd": "${workspaceFolder}/project/Swarm/server",
+            "stopAtEntry": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/usr/bin/gdb",
+            "externalConsole": false
+        }
+    ],
+    "compounds": [
+        {
+            "name": "Client + Server (Debug)",
+            "configurations": [
+                "Server (Debug)",
+                "Client (Debug)"
+            ],
+            "stopAll": true
+        }
+    ]
+}

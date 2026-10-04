@@ -18,7 +18,8 @@ FetchContent_MakeAvailable(glm)
 
 add_executable(client "src/main.cpp" "src/Resources.cpp" "src/InputHandler.cpp" "src/GameObject.cpp" "src/Animation.h" "src/AnimationData.h" "src/GameObject.h"
                 "src/Resources.h" "src/SDLState.h" "src/AnimationTypes.h" "src/InputHandler.h"
-                "../common/include/Protocol.h" "src/Network.cpp" "src/Network.h")
+                "../common/include/Protocol.h" "src/Network.cpp" "src/Network.h" "src/GameScene.cpp" "src/GameScene.h" "src/Scene.h" "src/GameConstants.h"
+                "src/LoginScene.cpp" "src/LoginScene.h")
 
 target_include_directories(client PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../common/include"

@@ -12,10 +12,17 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/g-truc/glm.git
     GIT_TAG        1.0.3
 )
-FetchContent_MakeAvailable(glm)
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+)
+FetchContent_MakeAvailable(glm nlohmann_json)
 
 add_executable(server
     main.cpp
+    TcpServer.cpp
+    TcpServer.h
 )
 
 target_include_directories(server PRIVATE
@@ -30,4 +37,5 @@ target_compile_options(server PRIVATE
 
 target_link_libraries(server PRIVATE
     glm::glm
+    nlohmann_json::nlohmann_json
 )
