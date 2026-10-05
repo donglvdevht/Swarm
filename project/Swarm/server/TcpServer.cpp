@@ -10,7 +10,8 @@
 #include <fstream>
 #include <random>
 #include <algorithm>
-#include <nlohmann/json.hpp>
+#include <sqlite3.h>
+#include "Database.h"
 
 namespace
 {
@@ -40,29 +41,19 @@ TcpServer::~TcpServer()
 // --- Khởi động ---
 bool TcpServer::loadUsers(const std::string& path)
 {
-    std::ifstream file(path);
-
-    if (!file)
-    {
-        printf("Can't open");
+    if (!db.open(path)) {
         return false;
     }
 
-    try
-    {
-        const nlohmann::json doc = nlohmann::json::parse(file);
-        for (const auto& u : doc.at("users"))
-        {
-            users_[u.at("name").get<std::string>()] = u.at("password").get<std::string>();
-        }
-    }
-    catch (const std::exception& e) {
-        std::fprintf(stderr, "bad %s: %s\n", path.c_str(), e.what());
+    // Tạo bảng mới nếu không có sẵn (chạy lần đầu)
+    const char* createSql =
+        "CREATE TABLE IF NOT EXISTS users ("
+        "  name     TEXT PRIMARY KEY,"
+        "  password TEXT NOT NULL"
+        ");";
+    if (!db.exec(createSql)) {
         return false;
     }
-
-    std::printf("loaded %zu users from %s\n", users_.size(), path.c_str());
-
     return true;
 }
 
@@ -259,14 +250,14 @@ bool TcpServer::makeResponse(const LoginRequestMsg& req, uint64_t nowMs, LoginRe
     const std::string name(req.name, strnlen(req.name, sizeof(req.name)));
     const std::string password(req.password, strnlen(req.password, sizeof(req.password)));
 
-    const auto user = users_.find(name);
-    if (user == users_.end())
+    std::string storedPassword;
+    if (!db.getUserPassword(name, storedPassword))
     {
         resp.status = static_cast<uint8_t>(LoginStatus::NAME_TAKEN);
         return false;
     }
 
-    if (user->second != password)
+    if (storedPassword != password)
     {
         resp.status = static_cast<uint8_t>(LoginStatus::WRONG_PASSWORD);
         return false;

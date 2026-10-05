@@ -19,10 +19,13 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(glm nlohmann_json)
 
+find_package(SQLite3 REQUIRED)
+
 add_executable(server
     main.cpp
     TcpServer.cpp
     TcpServer.h
+    Database.h
 )
 
 target_include_directories(server PRIVATE
@@ -38,4 +41,5 @@ target_compile_options(server PRIVATE
 target_link_libraries(server PRIVATE
     glm::glm
     nlohmann_json::nlohmann_json
+    SQLite::SQLite3
 )

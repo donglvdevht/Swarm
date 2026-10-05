@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 #include "TcpProtocol.h"
+#include "Database.h"
 
 // Server login TCP, non-blocking, dùng chung vòng poll() với UDP trong main.
 // Mỗi kết nối: nhận LoginRequestMsg -> trả LoginResponseMsg -> đóng.
@@ -48,9 +49,9 @@ private:
     uint16_t udpPort_  = 0;
     uint32_t nextPlayerID_ = 1;
 
-    std::unordered_map<std::string, std::string> users_;   // name -> password
     std::unordered_map<uint64_t, Session> sessions_;
     std::vector<Conn> conns_;
+    Database db;
 
     bool loadUsers(const std::string& path);
     void acceptAll(uint64_t nowMs);

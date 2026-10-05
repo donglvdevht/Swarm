@@ -263,7 +263,7 @@ int main(int argc, char** argv)
     }
 
     TcpServer tcp;
-    if (!tcp.start(9000, argc > 1 ? argv[1] : "users.json", 9000)) {
+    if (!tcp.start(9000, argc > 1 ? argv[1] : "users.db", 9000)) {
         close(sock);
         return 1;
     }

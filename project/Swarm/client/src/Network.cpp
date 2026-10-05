@@ -59,7 +59,7 @@ void Network::startTcpConnect(const std::string& strIp, uint16_t uPort, uint64_t
 
     loginStartMs_ = nowTime;
     const int r = connect(tcpSock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    if (r == 0) {   // Kết nối thành công
+    if (r == 0) {                       // Kết nối thành công
         buildRequest();
         connState_ = ConnState::TcpSending;
     } else if (errno == EINPROGRESS) {  // Đang tiến hành xử lí login
