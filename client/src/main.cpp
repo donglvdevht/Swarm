@@ -1,6 +1,9 @@
 #include <cstdio>
 #include <SDL3_image/SDL_image.h>
 #include <SDL3/SDL_stdinc.h>
+#include <imgui.h>
+#include <backends/imgui_impl_sdl3.h>
+#include <backends/imgui_impl_sdlrenderer3.h>
 #include <array>
 #include <vector>
 #include <string>
@@ -72,11 +75,17 @@ int main() {
         SDL_Event event{0};
         while (SDL_PollEvent(&event))
         {
+            ImGui_ImplSDL3_ProcessEvent(&event);
             if (event.type == SDL_EVENT_QUIT) 
             {
                 running = false; 
                 break;
             }
+
+            const ImGuiIO& io = ImGui::GetIO();
+            if (io.WantCaptureMouse || io.WantCaptureKeyboard)
+                continue;
+
             scene->handleEvent(event);
         }
         scene->update(deltaTime);
@@ -92,6 +101,22 @@ int main() {
         SDL_SetRenderScale(state.renderer, 2.0f, 2.0f);
         SDL_RenderDebugTextFormat(state.renderer, 5.0f, 5.0f, "FPS: %d", currentFps);
         SDL_SetRenderScale(state.renderer, 1.0f, 1.0f);
+
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+
+        static bool showDebugWindow = true;
+        ImGui::SetNextWindowPos(ImVec2(12.0f, 36.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Swarm Runtime", &showDebugWindow))
+        {
+            ImGui::Text("FPS: %d", currentFps);
+            ImGui::Text("Frame time: %.2f ms", deltaTime * 1000.0f);
+        }
+        ImGui::End();
+
+        ImGui::Render();
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), state.renderer);
 
         SDL_RenderPresent(state.renderer);
 
@@ -118,8 +143,31 @@ int main() {
 
 void cleanup(SDLState &state)
 {
-    SDL_DestroyRenderer(state.renderer);
-    SDL_DestroyWindow(state.window);
+    if (state.imguiRendererInitialized)
+    {
+        ImGui_ImplSDLRenderer3_Shutdown();
+        state.imguiRendererInitialized = false;
+    }
+    if (state.imguiPlatformInitialized)
+    {
+        ImGui_ImplSDL3_Shutdown();
+        state.imguiPlatformInitialized = false;
+    }
+    if (state.imguiContextInitialized)
+    {
+        ImGui::DestroyContext();
+        state.imguiContextInitialized = false;
+    }
+    if (state.renderer)
+    {
+        SDL_DestroyRenderer(state.renderer);
+        state.renderer = nullptr;
+    }
+    if (state.window)
+    {
+        SDL_DestroyWindow(state.window);
+        state.window = nullptr;
+    }
     SDL_Quit();
 }
 
@@ -145,5 +193,28 @@ bool initialize(SDLState &state)
     }
 
     SDL_SetRenderLogicalPresentation(state.renderer, state.logicalWidth, state.logicalHeight, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    state.imguiContextInitialized = true;
+    ImGui::GetIO().IniFilename = nullptr;
+    ImGui::StyleColorsDark();
+
+    if (!ImGui_ImplSDL3_InitForSDLRenderer(state.window, state.renderer))
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Could not initialize the Dear ImGui SDL3 platform backend.", state.window);
+        cleanup(state);
+        return 1;
+    }
+    state.imguiPlatformInitialized = true;
+
+    if (!ImGui_ImplSDLRenderer3_Init(state.renderer))
+    {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", "Could not initialize the Dear ImGui SDL3 renderer backend.", state.window);
+        cleanup(state);
+        return 1;
+    }
+    state.imguiRendererInitialized = true;
+
     return 0;
 }

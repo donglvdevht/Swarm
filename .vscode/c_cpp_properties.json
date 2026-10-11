@@ -4,9 +4,9 @@
             "name": "Linux",
             "includePath": [
                 "${workspaceFolder}/**",
-                "${workspaceFolder}/project/Swarm/my-client/vcpkg/installed/x64-linux/include"
+                "${workspaceFolder}/vcpkg/installed/x64-linux/include"
             ],
-            "compileCommands": "${workspaceFolder}/project/Swarm/my-client/build/compile_commands.json",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json",
             "defines": [],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "c17",
