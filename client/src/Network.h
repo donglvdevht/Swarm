@@ -8,7 +8,9 @@
 #include <mutex>
 #include <vector>
 #include <deque>
+#include <string>
 #include <sys/types.h>
+#include <poll.h>
 
 struct ServerState {
     uint32_t lastProcessedSeq = 0;
@@ -21,6 +23,12 @@ struct ServerState {
 struct SentInput {
     uint32_t seq;
     bool up, down, left, right, run;
+};
+
+struct ChatMessage {
+    uint32_t playerID = 0;
+    std::string sender;
+    std::string text;
 };
 
 constexpr uint8_t LOGIN_NET_ERROR = 255;   // lỗi mạng/timeout, không phải LoginStatus từ server
@@ -52,6 +60,8 @@ public:
     ServerState getSeverState();
     ConnState getConnState()  const { return connState_.load(); }
     uint8_t   getLastStatus() const { return lastStatus_.load(); }
+    bool sendChatMessage(const std::string& text);
+    std::vector<ChatMessage> takeChatMessages();
 
     // Các input đã gửi nhưng server chưa xác nhận (seq > ackSeq), dùng cho reconciliation
     std::vector<SentInput> getUnackedInputs(uint32_t ackSeq);
@@ -68,6 +78,11 @@ private:
     std::string pendingName_, pendingPass_;
     char rxBuf_[sizeof(LoginResponseMsg)];  size_t rxGot_ = 0;
     std::vector<char> txBuf_;   size_t txSent_ = 0;
+    std::vector<char> tcpRxBuffer_;
+    std::deque<std::vector<char>> chatTxQueue_;
+    size_t chatTxOffset_ = 0;
+    size_t chatTxQueuedBytes_ = 0;
+    std::deque<ChatMessage> chatRxQueue_;
 
     uint32_t playerID_;
     uint64_t sessionToken_ = 0;
@@ -81,6 +96,7 @@ private:
     std::mutex inputMutex_;
     std::mutex stateMutex_;
     std::mutex loginMutex_;
+    std::mutex chatMutex_;
 
     static constexpr uint64_t SERVER_TIMEOUT_MS = 3000;
     static constexpr uint64_t LOGIN_TIMEOUT_MS = 5000;
@@ -88,11 +104,16 @@ private:
     void networkLoop();
     void handlePacket(const char* buffer, ssize_t n);
     void checkServerTimeout(uint64_t nowTime);
-    void pumpLogin(uint64_t nowTime);
+    void pumpLogin(uint64_t nowTime, short int revents);
     void buildRequest();
     void finishLogin();
     bool connectUdp(uint16_t port);
     void closeTcp();
+    void checkTimeout(uint64_t nowTime);
+    bool hasPendingChat();
+    bool flushChat();
+    bool receiveChat();
+    bool parseChatFrames();
 
     struct InputSnapshot{
         bool up = false;

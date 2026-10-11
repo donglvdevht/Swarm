@@ -3,10 +3,11 @@
 #pragma pack(push, 1)
 constexpr uint16_t MAX_FRAME_PAYLOAD = 512;
 constexpr uint16_t MAX_NAME_LEN = 16;
+constexpr uint16_t MAX_CHAT_TEXT_LEN = 256;
 constexpr uint16_t PROTOCOL_VERSION = 1;
 
 struct TcpFrameHeader {
-    uint16_t length;
+    uint16_t length; // Payload size, network byte order
     uint8_t  type;
 };
 
@@ -23,6 +24,12 @@ struct LoginResponseMsg {
     uint16_t udpPort;
     float    spawnX, spawnY;
 };
+
+struct ChatMessagePayload {
+    uint32_t playerID; // Network byte order; assigned by the server
+    char     sender[MAX_NAME_LEN];
+    char     text[MAX_CHAT_TEXT_LEN];
+};
 #pragma pack(pop)
 
 enum class LoginStatus : uint8_t {
@@ -36,5 +43,5 @@ enum class LoginStatus : uint8_t {
 enum class TcpMsgType : uint8_t {
     LOGIN_REQUEST  = 1,
     LOGIN_RESPONSE = 2,
-    LOGOUT         = 3,
+    CHAT_MESSAGE   = 3,
 };

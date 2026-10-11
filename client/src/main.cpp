@@ -94,6 +94,10 @@ int main() {
         SDL_SetRenderDrawColor(state.renderer, 20, 10, 30, 255);
         SDL_RenderClear(state.renderer);
 
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+
         scene->render(state, deltaTime);
 
         // --- Hiển thị FPS ở góc trên-trái ---
@@ -101,10 +105,6 @@ int main() {
         SDL_SetRenderScale(state.renderer, 2.0f, 2.0f);
         SDL_RenderDebugTextFormat(state.renderer, 5.0f, 5.0f, "FPS: %d", currentFps);
         SDL_SetRenderScale(state.renderer, 1.0f, 1.0f);
-
-        ImGui_ImplSDLRenderer3_NewFrame();
-        ImGui_ImplSDL3_NewFrame();
-        ImGui::NewFrame();
 
         static bool showDebugWindow = true;
         ImGui::SetNextWindowPos(ImVec2(12.0f, 36.0f), ImGuiCond_FirstUseEver);

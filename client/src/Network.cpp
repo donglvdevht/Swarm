@@ -5,6 +5,14 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <SDL3/SDL.h>
+#include <algorithm>
+#include <cstring>
+
+namespace
+{
+constexpr size_t MAX_QUEUED_CHAT_BYTES = 64 * 1024;
+constexpr size_t MAX_RECEIVED_CHAT_MESSAGES = 100;
+}
 
 Network::Network() = default;
 Network::~Network(){
@@ -49,8 +57,14 @@ void Network::startTcpConnect(const std::string& strIp, uint16_t uPort, uint64_t
     tcpSock_ = socket(AF_INET, SOCK_STREAM, 0);
     if (tcpSock_ < 0) { failLogin(); return; }
 
-    const int fl = fcntl(tcpSock_, F_GETFL, 0);
-    fcntl(tcpSock_, F_SETFL, fl | O_NONBLOCK);
+    int flag = fcntl(tcpSock_, F_GETFL, 0);
+    if (flag < 0 || fcntl(tcpSock_, F_SETFL, flag | O_NONBLOCK) < 0) {
+        perror("fcntl(udp)");
+        close(tcpSock_);
+        tcpSock_ = -1;
+        failLogin();
+        return;
+    }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -79,25 +93,38 @@ void Network::beginLogin(const std::string& name, const std::string& pass)
     loginRequested_ = true;
 }
 
-void Network::pumpLogin(uint64_t nowTime)
+void Network::pumpLogin(uint64_t nowTime, short int revents)
 {
-    if (nowTime - loginStartMs_ > LOGIN_TIMEOUT_MS) { failLogin(); return; }
+    const ConnState state = connState_.load();
+    if ((state == ConnState::TcpConnecting ||
+         state == ConnState::TcpSending ||
+         state == ConnState::TcpReceiving) &&
+        nowTime - loginStartMs_ > LOGIN_TIMEOUT_MS) {
+        failLogin();
+        return;
+    }
 
-    switch (connState_.load())
+    switch (state)
     {
         case ConnState::TcpConnecting:
         {
-            int err = 0; socklen_t len = sizeof(err);
-            if (getsockopt(tcpSock_, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-                failLogin();                         // err = ECONNREFUSED / EHOSTUNREACH...
-                return;
+            if (revents & POLLNVAL) { failLogin(); return; }
+            if (revents & (POLLOUT | POLLERR | POLLHUP))
+            {
+                int err = 0; socklen_t len = sizeof(err);
+                if (getsockopt(tcpSock_, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+                    failLogin();                         // err = ECONNREFUSED / EHOSTUNREACH...
+                    return;
+                }
+                buildRequest();
+                connState_ = ConnState::TcpSending;
             }
-            buildRequest();
-            connState_ = ConnState::TcpSending;
             break;
         }
         case ConnState::TcpSending: 
         {
+            if (revents & (POLLERR | POLLHUP | POLLNVAL)) { failLogin(); return; }
+            if (!(revents & POLLOUT)) return;
             const ssize_t n = send(tcpSock_, txBuf_.data() + txSent_,
                                 txBuf_.size() - txSent_, MSG_NOSIGNAL);
             if (n < 0) {
@@ -113,6 +140,11 @@ void Network::pumpLogin(uint64_t nowTime)
         }
         case ConnState::TcpReceiving:
         {
+            if (revents & POLLNVAL) { failLogin(); return; }
+            if (!(revents & POLLIN)) {
+                if (revents & (POLLERR | POLLHUP)) failLogin();
+                return;
+            }
             const ssize_t n = recv(tcpSock_, rxBuf_ + rxGot_, sizeof(rxBuf_) - rxGot_, 0);
             if (n == 0) { failLogin(); return; }        // server đóng
             if (n < 0) {
@@ -125,6 +157,9 @@ void Network::pumpLogin(uint64_t nowTime)
         }
         case ConnState::Connected:
         {
+            if (revents & (POLLERR | POLLHUP | POLLNVAL)) { failLogin(); return; }
+            if ((revents & POLLOUT) && !flushChat()) { failLogin(); return; }
+            if ((revents & POLLIN) && !receiveChat()) { failLogin(); return; }
             break;
         }
         default: break;
@@ -154,12 +189,12 @@ void Network::finishLogin()
 {
     LoginResponseMsg resp{};
     memcpy(&resp, rxBuf_, sizeof(resp));
-    closeTcp();
 
     lastStatus_ = resp.status;
 
     if (resp.status != static_cast<uint8_t>(LoginStatus::OK))
     {
+        closeTcp();
         connState_ = ConnState::Failed;
         return;
     }
@@ -212,19 +247,27 @@ void Network::closeTcp()
 
 void Network::failLogin()
 {
+    connState_ = ConnState::Failed;
     closeTcp();
     txBuf_.clear();
     txSent_ = 0;
     rxGot_  = 0;
+    tcpRxBuffer_.clear();
+    {
+        std::lock_guard<std::mutex> lock(chatMutex_);
+        chatTxQueue_.clear();
+        chatTxOffset_ = 0;
+        chatTxQueuedBytes_ = 0;
+    }
 
     lastStatus_ = LOGIN_NET_ERROR;
-    connState_ = ConnState::Failed;
 }
 
 void Network::stop()
 {
     running_ = false;
     if (thread_.joinable()) thread_.join();
+    closeTcp();
     close(sock_);
     sock_ = -1;
 }
@@ -249,26 +292,183 @@ void Network::updateInput(bool up, bool down, bool left, bool right, bool attack
     pendingSendInput_.run |= run;
 }
 
+bool Network::sendChatMessage(const std::string& text)
+{
+    if (text.empty() || text.size() >= MAX_CHAT_TEXT_LEN ||
+        connState_.load() != ConnState::Connected) {
+        return false;
+    }
+
+    ChatMessagePayload payload{};
+    std::memcpy(payload.text, text.data(), text.size());
+
+    TcpFrameHeader header{};
+    header.length = htons(static_cast<uint16_t>(sizeof(payload)));
+    header.type = static_cast<uint8_t>(TcpMsgType::CHAT_MESSAGE);
+
+    std::vector<char> frame(sizeof(header) + sizeof(payload));
+    std::memcpy(frame.data(), &header, sizeof(header));
+    std::memcpy(frame.data() + sizeof(header), &payload, sizeof(payload));
+
+    std::lock_guard<std::mutex> lock(chatMutex_);
+    if (connState_.load() != ConnState::Connected) return false;
+    if (chatTxQueuedBytes_ + frame.size() > MAX_QUEUED_CHAT_BYTES) {
+        return false;
+    }
+    chatTxQueuedBytes_ += frame.size();
+    chatTxQueue_.push_back(std::move(frame));
+    return true;
+}
+
+std::vector<ChatMessage> Network::takeChatMessages()
+{
+    std::lock_guard<std::mutex> lock(chatMutex_);
+    std::vector<ChatMessage> messages;
+    messages.reserve(chatRxQueue_.size());
+    while (!chatRxQueue_.empty()) {
+        messages.push_back(std::move(chatRxQueue_.front()));
+        chatRxQueue_.pop_front();
+    }
+    return messages;
+}
+
+bool Network::hasPendingChat()
+{
+    std::lock_guard<std::mutex> lock(chatMutex_);
+    return !chatTxQueue_.empty();
+}
+
+bool Network::flushChat()
+{
+    std::lock_guard<std::mutex> lock(chatMutex_);
+    while (!chatTxQueue_.empty())
+    {
+        std::vector<char>& frame = chatTxQueue_.front();
+        const ssize_t sent = send(tcpSock_, frame.data() + chatTxOffset_,
+                                  frame.size() - chatTxOffset_, MSG_NOSIGNAL);
+        if (sent > 0) {
+            chatTxOffset_ += static_cast<size_t>(sent);
+            if (chatTxOffset_ == frame.size()) {
+                chatTxQueuedBytes_ -= frame.size();
+                chatTxQueue_.pop_front();
+                chatTxOffset_ = 0;
+            }
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+        return false;
+    }
+    return true;
+}
+
+bool Network::receiveChat()
+{
+    char buffer[1024];
+    while (true)
+    {
+        const ssize_t received = recv(tcpSock_, buffer, sizeof(buffer), 0);
+        if (received > 0) {
+            tcpRxBuffer_.insert(tcpRxBuffer_.end(), buffer, buffer + received);
+            if (!parseChatFrames()) return false;
+        } else if (received == 0) {
+            return false;
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
+bool Network::parseChatFrames()
+{
+    constexpr size_t headerSize = sizeof(TcpFrameHeader);
+    constexpr size_t payloadSize = sizeof(ChatMessagePayload);
+    while (tcpRxBuffer_.size() >= headerSize)
+    {
+        TcpFrameHeader header{};
+        std::memcpy(&header, tcpRxBuffer_.data(), headerSize);
+        const uint16_t length = ntohs(header.length);
+        if (header.type != static_cast<uint8_t>(TcpMsgType::CHAT_MESSAGE) ||
+            length != payloadSize) {
+            return false;
+        }
+
+        const size_t frameSize = headerSize + length;
+        if (tcpRxBuffer_.size() < frameSize) return true;
+
+        ChatMessagePayload payload{};
+        std::memcpy(&payload, tcpRxBuffer_.data() + headerSize, sizeof(payload));
+        const size_t textLength = strnlen(payload.text, sizeof(payload.text));
+        if (textLength == 0 || textLength == sizeof(payload.text)) return false;
+
+        ChatMessage message;
+        message.playerID = ntohl(payload.playerID);
+        message.sender.assign(payload.sender, strnlen(payload.sender, sizeof(payload.sender)));
+        message.text.assign(payload.text, textLength);
+        {
+            std::lock_guard<std::mutex> lock(chatMutex_);
+            if (chatRxQueue_.size() == MAX_RECEIVED_CHAT_MESSAGES)
+                chatRxQueue_.pop_front();
+            chatRxQueue_.push_back(std::move(message));
+        }
+        tcpRxBuffer_.erase(tcpRxBuffer_.begin(),
+                           tcpRxBuffer_.begin() + static_cast<std::ptrdiff_t>(frameSize));
+    }
+    return true;
+}
+
 void Network::networkLoop()
 {
     uint64_t lastSendTime = 0;
     while (running_)
     {
         uint64_t nowTime = SDL_GetTicks();
+        bool didWork = false;
 
-        if (loginRequested_.exchange(false)) startTcpConnect("127.0.0.1", 9000, nowTime);
+        if (loginRequested_.exchange(false))
+            startTcpConnect(serverIp_, fallbackUdpPort_, nowTime);
 
-        switch (connState_.load()) {
+        pollfd p{tcpSock_, 0, 0};
+        bool needPoll = false;
+
+        ConnState st = connState_.load();
+        switch (st) {
             case ConnState::TcpConnecting:
+                p.events = POLLOUT;  needPoll = true; break;
             case ConnState::TcpSending:
+                p.events = POLLOUT;  needPoll = true; break;
             case ConnState::TcpReceiving:
-                pumpLogin(nowTime);
+                p.events = POLLIN;   needPoll = true; break;
+            case ConnState::Connected:
+                p.events = POLLIN;
+                if (hasPendingChat()) p.events |= POLLOUT;
+                needPoll = true;
                 break;
             default: break;
         }
 
-        if (connState_ != ConnState::Connected) {      // chưa login thì chưa bắn UDP
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (needPoll) {
+            const int ready = poll(&p, 1, st == ConnState::Connected ? 0 : 10);
+            if (ready > 0) {
+                pumpLogin(nowTime, p.revents);
+                didWork = true;
+            } else if (ready == 0 || errno == EINTR) {
+                checkTimeout(nowTime);
+            } else {
+                perror("poll(tcp)");
+                failLogin();
+            }
+        }
+
+        if (st != ConnState::Connected) {      // chưa login thì chưa bắn UDP
+            if (!didWork)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
             continue;
         }
 
@@ -394,4 +594,20 @@ std::vector<SentInput> Network::getUnackedInputs(uint32_t ackSeq)
     for (const SentInput& in : sentHistory_)
         if (in.seq > ackSeq) out.push_back(in);
     return out;
+}
+
+void Network::checkTimeout(uint64_t nowTime)
+{
+    ConnState st = connState_.load();
+
+    // Login timeout
+    if (st == ConnState::TcpConnecting ||
+        st == ConnState::TcpSending   ||
+        st == ConnState::TcpReceiving)
+    {
+        if (nowTime - loginStartMs_ > LOGIN_TIMEOUT_MS) {
+            failLogin();
+            return;
+        }
+    }
 }

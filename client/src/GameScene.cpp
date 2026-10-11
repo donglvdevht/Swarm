@@ -1,5 +1,6 @@
 #include "GameScene.h"
 #include "GameConstants.h"
+#include <imgui.h>
 
 #ifndef SWARM_ASSET_DIR
 #define SWARM_ASSET_DIR "."
@@ -245,6 +246,13 @@ void GameScene::handleEvent(const SDL_Event& e)
 
 void GameScene::update(float deltaTime)
 {
+    std::vector<ChatMessage> newMessages = network.takeChatMessages();
+    chatHasNewMessages_ = chatHasNewMessages_ || !newMessages.empty();
+    for (ChatMessage& message : newMessages) {
+        chatHistory_.push_back(std::move(message));
+        if (chatHistory_.size() > 100) chatHistory_.pop_front();
+    }
+
     const bool moveUp = inputHandler.isHeld(InputHandler::Action::MoveUp);
     const bool moveDown = inputHandler.isHeld(InputHandler::Action::MoveDown);
     const bool moveLeft = inputHandler.isHeld(InputHandler::Action::MoveLeft);
@@ -343,4 +351,38 @@ void GameScene::render(const SDLState& state, float deltaTime)
             GameSceneFunc::drawDecorationObject(state, *item.obj);
         }
     }
+
+    ImGui::SetNextWindowPos(ImVec2(12.0f, ImGui::GetIO().DisplaySize.y - 244.0f),
+                            ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(360.0f, 232.0f), ImGuiCond_Always);
+    if (ImGui::Begin("Chat", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+        if (ImGui::BeginChild("##chat-history", ImVec2(0.0f, -ImGui::GetFrameHeightWithSpacing()),
+                              ImGuiChildFlags_Borders)) {
+            const bool wasAtBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
+            for (const ChatMessage& message : chatHistory_)
+                ImGui::TextWrapped("%s: %s", message.sender.c_str(), message.text.c_str());
+            if (chatHasNewMessages_ && wasAtBottom)
+                ImGui::SetScrollHereY(1.0f);
+            chatHasNewMessages_ = false;
+        }
+        ImGui::EndChild();
+
+        ImGui::SetNextItemWidth(-74.0f);
+        const bool submitOnEnter = ImGui::InputText(
+            "##chat-input", chatInput_.data(), chatInput_.size(),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        const bool clicked = ImGui::Button("Send");
+        if ((submitOnEnter || clicked) && chatInput_[0] != '\0') {
+            chatSendFailed_ = !network.sendChatMessage(chatInput_.data());
+            if (!chatSendFailed_) chatInput_.fill('\0');
+        }
+        if (chatSendFailed_) {
+            const char* error = network.getConnState() == ConnState::Connected
+                ? "Chat queue is full. Please try again."
+                : "Disconnected from server. Reconnect to send chat.";
+            ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.38f, 1.0f), "%s", error);
+        }
+    }
+    ImGui::End();
 }

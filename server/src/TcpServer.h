@@ -7,8 +7,7 @@
 #include "TcpProtocol.h"
 #include "Database.h"
 
-// Server login TCP, non-blocking, dùng chung vòng poll() với UDP trong main.
-// Mỗi kết nối: nhận LoginRequestMsg -> trả LoginResponseMsg -> đóng.
+// TCP handles login and persistent, bidirectional chat connections.
 class TcpServer
 {
 public:
@@ -34,6 +33,12 @@ private:
         std::vector<char> tx;       // response, rỗng nghĩa là chưa có
         size_t   txSent = 0;
         bool     replied = false;
+        bool     authenticated = false;
+        bool     closeAfterFlush = false;
+        uint32_t playerID = 0;
+        uint64_t sessionToken = 0;
+        std::string playerName;
+        std::vector<char> frameRx;
     };
 
     struct Session
@@ -51,6 +56,7 @@ private:
 
     std::unordered_map<uint64_t, Session> sessions_;
     std::vector<Conn> conns_;
+    std::vector<int> deferredClose_;
     Database db;
 
     bool loadUsers(const std::string& path);
@@ -60,7 +66,10 @@ private:
 
     bool serve(Conn& c, short revents, uint64_t nowMs);   // false = đóng kết nối này
     bool readRequest(Conn& c);            // false = peer đóng / lỗi
-    bool flush(Conn& c);                  // true  = gửi xong hoặc lỗi
+    bool readChatFrames(Conn& c, uint64_t nowMs);
+    bool flush(Conn& c);                  // false = socket error
+    void broadcastChat(const ChatMessagePayload& message);
+    bool queueFrame(Conn& c, const ChatMessagePayload& message);
     bool makeResponse(const LoginRequestMsg& req, uint64_t nowMs,
                       LoginResponseMsg& resp);
 };

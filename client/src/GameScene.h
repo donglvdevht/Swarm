@@ -9,6 +9,7 @@
 #include "GameObject.h"
 #include "Resources.h"
 #include "Network.h"
+#include <array>
 
 struct GameState
 {
@@ -45,4 +46,8 @@ private:
     uint32_t lastAckedSeq = 0;
     glm::vec2 correctionTarget{0.0f};
     bool hasCorrection = false;
+    std::array<char, MAX_CHAT_TEXT_LEN> chatInput_{};
+    std::deque<ChatMessage> chatHistory_;
+    bool chatHasNewMessages_ = false;
+    bool chatSendFailed_ = false;
 };

@@ -17,6 +17,7 @@ namespace
 {
 constexpr float SPAWN_X = 640.0f;
 constexpr float SPAWN_Y = 360.0f;
+constexpr size_t MAX_QUEUED_TCP_BYTES = 64 * 1024;
 
 bool setNonBlocking(int fd)
 {
@@ -122,10 +123,11 @@ TcpServer::Conn* TcpServer::findConn(int fd)
 
 void TcpServer::closeConn(int fd)
 {
+    const auto it = std::find_if(conns_.begin(), conns_.end(),
+                                 [fd](const Conn& c) { return c.fd == fd; });
+    if (it == conns_.end()) return;
     close(fd);
-    conns_.erase(std::remove_if(conns_.begin(), conns_.end(),
-                                [fd](const Conn& c) { return c.fd == fd; }),
-                 conns_.end());
+    conns_.erase(it);
 }
 
 // --- Poll ---
@@ -134,7 +136,15 @@ void TcpServer::appendPollFds(std::vector<pollfd>& fds) const
     fds.push_back(pollfd{listenFd_ , POLLIN, 0});
     for (const Conn& c : conns_)
     {
-        const short events = static_cast<short>(c.replied ? POLLOUT : POLLIN);
+        short events = 0;
+        if (!c.replied) {
+            events = POLLIN;
+        } else if (c.authenticated) {
+            events = POLLIN;
+            if (c.txSent < c.tx.size()) events |= POLLOUT;
+        } else if (c.txSent < c.tx.size()) {
+            events = POLLOUT;
+        }
         fds.push_back(pollfd{c.fd, events, 0});
     }
 }
@@ -155,6 +165,46 @@ void TcpServer::handleEvents(const std::vector<pollfd>& fds, size_t first, uint6
         Conn* c = findConn(p.fd);
         if (c && !serve(*c, p.revents, nowMs)) closeConn(p.fd);
     }
+
+    std::sort(deferredClose_.begin(), deferredClose_.end());
+    deferredClose_.erase(std::unique(deferredClose_.begin(), deferredClose_.end()),
+                         deferredClose_.end());
+    for (int fd : deferredClose_) closeConn(fd);
+    deferredClose_.clear();
+}
+
+void TcpServer::broadcastChat(const ChatMessagePayload& message)
+{
+    for (Conn& conn : conns_)
+    {
+        if (conn.authenticated && !queueFrame(conn, message)) {
+            std::fprintf(stderr, "Closing slow TCP chat client (fd=%d): send queue limit exceeded.\n",
+                         conn.fd);
+            deferredClose_.push_back(conn.fd);
+        }
+    }
+}
+
+bool TcpServer::queueFrame(Conn& conn, const ChatMessagePayload& message)
+{
+    TcpFrameHeader header{};
+    header.length = htons(static_cast<uint16_t>(sizeof(message)));
+    header.type = static_cast<uint8_t>(TcpMsgType::CHAT_MESSAGE);
+
+    const size_t frameSize = sizeof(header) + sizeof(message);
+    if (conn.tx.size() - conn.txSent + frameSize > MAX_QUEUED_TCP_BYTES) {
+        return false;
+    }
+
+    if (conn.txSent > 0) {
+        conn.tx.erase(conn.tx.begin(), conn.tx.begin() + static_cast<std::ptrdiff_t>(conn.txSent));
+        conn.txSent = 0;
+    }
+    const char* headerBytes = reinterpret_cast<const char*>(&header);
+    const char* messageBytes = reinterpret_cast<const char*>(&message);
+    conn.tx.insert(conn.tx.end(), headerBytes, headerBytes + sizeof(header));
+    conn.tx.insert(conn.tx.end(), messageBytes, messageBytes + sizeof(message));
+    return true;
 }
 
 void TcpServer::sweep(uint64_t nowMs)
@@ -162,19 +212,34 @@ void TcpServer::sweep(uint64_t nowMs)
     std::vector<int> expired;
     for (const Conn& c : conns_)
     {
-        if (nowMs - c.startMs >= LOGIN_TIMEOUT_MS)
+        if (!c.authenticated && nowMs - c.startMs >= LOGIN_TIMEOUT_MS)
             expired.push_back(c.fd);
     }
 
     for (int fd : expired)
         closeConn(fd);
 
+    std::vector<uint64_t> expiredSessions;
     for (auto it = sessions_.begin(); it != sessions_.end();)
     {
-        if (nowMs - it->second.lastSeenMs >= SESSION_TIMEOUT_MS)
+        if (nowMs - it->second.lastSeenMs >= SESSION_TIMEOUT_MS) {
+            expiredSessions.push_back(it->first);
             it = sessions_.erase(it);
-        else
+        } else {
             ++it;
+        }
+    }
+
+    for (auto it = conns_.begin(); it != conns_.end();)
+    {
+        const bool sessionExpired = std::find(
+            expiredSessions.begin(), expiredSessions.end(), it->sessionToken) != expiredSessions.end();
+        if (it->authenticated && sessionExpired) {
+            close(it->fd);
+            it = conns_.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -194,21 +259,93 @@ bool TcpServer::authenticateSession(uint64_t token, uint64_t nowMs)
 // --- Xử lý một kết nối ---
 bool TcpServer::serve(Conn& c, short revents, uint64_t nowMs)
 {
-    if (revents & (POLLERR | POLLNVAL)) return false;
+    if (revents & (POLLERR | POLLNVAL | POLLHUP)) return false;
 
     if (!c.replied)
     {
+        if (!(revents & POLLIN)) return true;
         if (!readRequest(c))        return false;
         if (c.rxGot < sizeof(c.rx)) return true;    // Chờ phần request còn lại.
         LoginRequestMsg req;
         memcpy(&req, &c.rx, sizeof(req));
-        LoginResponseMsg resp;
-        makeResponse(req, nowMs, resp);
+        LoginResponseMsg resp{};
+        const bool accepted = makeResponse(req, nowMs, resp);
         c.tx.resize(sizeof(resp));
         std::memcpy(c.tx.data(), &resp, sizeof(resp));
         c.replied = true;
+        c.authenticated = accepted;
+        c.closeAfterFlush = !accepted;
+        if (accepted) {
+            c.playerID = ntohl(resp.playerID);
+            c.sessionToken = resp.sessionToken;
+            c.playerName.assign(req.name, strnlen(req.name, sizeof(req.name)));
+        }
+        return true;
     }
-    return !flush(c);
+
+    if (c.authenticated && (revents & POLLIN) && !readChatFrames(c, nowMs))
+        return false;
+
+    if ((revents & POLLOUT) && !flush(c))
+        return false;
+
+    return !c.closeAfterFlush || !c.tx.empty();
+}
+
+bool TcpServer::readChatFrames(Conn& c, uint64_t nowMs)
+{
+    char buffer[1024];
+    while (true)
+    {
+        const ssize_t received = recv(c.fd, buffer, sizeof(buffer), 0);
+        if (received > 0) {
+            if (c.frameRx.size() + static_cast<size_t>(received) > MAX_QUEUED_TCP_BYTES)
+                return false;
+            c.frameRx.insert(c.frameRx.end(), buffer, buffer + received);
+        } else if (received == 0) {
+            return false;
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        } else {
+            return false;
+        }
+    }
+
+    constexpr size_t headerSize = sizeof(TcpFrameHeader);
+    constexpr size_t payloadSize = sizeof(ChatMessagePayload);
+    if (c.frameRx.size() > MAX_QUEUED_TCP_BYTES) return false;
+
+    while (c.frameRx.size() >= headerSize)
+    {
+        TcpFrameHeader header{};
+        std::memcpy(&header, c.frameRx.data(), headerSize);
+        const uint16_t length = ntohs(header.length);
+        if (header.type != static_cast<uint8_t>(TcpMsgType::CHAT_MESSAGE) ||
+            length != payloadSize) {
+            return false;
+        }
+
+        const size_t frameSize = headerSize + length;
+        if (c.frameRx.size() < frameSize) break;
+
+        ChatMessagePayload incoming{};
+        std::memcpy(&incoming, c.frameRx.data() + headerSize, sizeof(incoming));
+        const size_t textLength = strnlen(incoming.text, sizeof(incoming.text));
+        if (textLength == 0 || textLength == sizeof(incoming.text)) return false;
+        if (!authenticateSession(c.sessionToken, nowMs)) return false;
+
+        ChatMessagePayload broadcast{};
+        broadcast.playerID = htonl(c.playerID);
+        std::memcpy(broadcast.sender, c.playerName.data(),
+                    std::min(c.playerName.size(), sizeof(broadcast.sender)));
+        std::memcpy(broadcast.text, incoming.text, textLength);
+        broadcastChat(broadcast);
+        c.frameRx.erase(c.frameRx.begin(),
+                        c.frameRx.begin() + static_cast<std::ptrdiff_t>(frameSize));
+    }
+    return true;
 }
 
 bool TcpServer::readRequest(Conn& c)
@@ -232,16 +369,19 @@ bool TcpServer::flush(Conn& c)
 {
     while (c.txSent < c.tx.size())
     {
-        const ssize_t  n = send(c.fd, c.tx.data() + c.txSent, c.tx.size() - c.txSent, 0);
+        const ssize_t  n = send(c.fd, c.tx.data() + c.txSent, c.tx.size() - c.txSent,
+                                MSG_NOSIGNAL);
         if (n > 0)
         {
             c.txSent += static_cast<size_t>(n);
             continue;
         }
         if (n < 0 && errno == EINTR)                            continue;       // Thử lại
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return false;   // Socket chưa thể gửi tiếp được, chờ POLLOUT
-        return true;   // n == 0, hoặc lỗi -> bỏ qua kết nối
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return true;
+        return false;
     }
+    c.tx.clear();
+    c.txSent = 0;
     return true;
 }
 
@@ -266,7 +406,7 @@ bool TcpServer::makeResponse(const LoginRequestMsg& req, uint64_t nowMs, LoginRe
     const uint32_t playerID = nextPlayerID_++;
 
     resp.status = static_cast<uint8_t>(LoginStatus::OK);
-    resp.playerID = playerID;
+    resp.playerID = htonl(playerID);
     resp.sessionToken = randomToken();
     sessions_[resp.sessionToken] = Session{nowMs};
     resp.udpPort = htons(udpPort_);
